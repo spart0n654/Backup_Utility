@@ -1,0 +1,1 @@
+change the directories in the source and compile, worked for me with vs2022, my file directories are backup E:/Misc changes to D:/Backup/misc and then put deleted files to D:/Backup/deleted every hour
