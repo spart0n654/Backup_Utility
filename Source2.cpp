@@ -6,6 +6,7 @@
 #include <thread>
 #include <filesystem>
 #include <unordered_map>
+#include <future>
 
 // For easier use of filesystem library
 namespace fs = std::filesystem;
@@ -32,56 +33,89 @@ std::unordered_map<std::string, fs::file_time_type> getFileStates(const fs::path
 void runBackup() {
     std::cout << "Starting backup check..." << std::endl;
 
-    // Ensure backup and deleted directories exist
     fs::create_directories(backupDir);
     fs::create_directories(deletedDir);
 
-    auto sourceFiles = getFileStates(sourceDir);
+    // Calculate total data size in sourceDir
+    size_t totalSize = 0;
+    for (const auto& entry : fs::recursive_directory_iterator(sourceDir)) {
+        if (fs::is_regular_file(entry.path())) {
+            totalSize += fs::file_size(entry.path());
+        }
+    }
+    std::cout << "Scanning source files..." << std::endl;
+
+    // Scan source files
+    std::unordered_map<std::string, fs::file_time_type> sourceFiles;
+    for (const auto& entry : fs::recursive_directory_iterator(sourceDir)) {
+        if (fs::is_regular_file(entry.path())) {
+            std::string relativePath = fs::relative(entry.path(), sourceDir).string();
+            sourceFiles[relativePath] = fs::last_write_time(entry);
+        }
+    }
+    std::cout << "Scanning backup files..." << std::endl;
     auto backupFiles = getFileStates(backupDir);
 
     // 1. Check for new or modified files
+    std::vector<std::future<void>> copyTasks;
+    int filesToCopy = 0;
     for (const auto& [relativePath, sourceWriteTime] : sourceFiles) {
         fs::path sourceFilePath = sourceDir / relativePath;
         fs::path backupFilePath = backupDir / relativePath;
         bool needsCopy = false;
+        bool moveOldBackup = false;
 
         if (backupFiles.find(relativePath) == backupFiles.end()) {
-            // New file
             needsCopy = true;
-            std::cout << "New file detected: " << relativePath << std::endl;
-        }
-        else {
-            // Existing file, check for modification
-            if (sourceWriteTime > backupFiles.at(relativePath)) {
+        } else {
+            auto backupWriteTime = backupFiles.at(relativePath);
+            auto sourceSize = fs::file_size(sourceFilePath);
+            auto backupSize = fs::exists(backupFilePath) ? fs::file_size(backupFilePath) : 0;
+
+            if (sourceWriteTime > backupWriteTime || sourceSize != backupSize) {
                 needsCopy = true;
-                std::cout << "File modified: " << relativePath << std::endl;
+                moveOldBackup = true;
             }
         }
 
         if (needsCopy) {
-            // Ensure the directory exists in the backup
-            fs::create_directories(backupFilePath.parent_path());
-            fs::copy_file(sourceFilePath, backupFilePath, fs::copy_options::overwrite_existing);
-            std::cout << "Copied " << relativePath << " to backup." << std::endl;
+            ++filesToCopy;
+            std::cout << "Copying: " << relativePath << std::endl;
+            copyTasks.push_back(std::async(std::launch::async, [=]() {
+                if (moveOldBackup && fs::exists(backupFilePath)) {
+                    fs::path deletedBackupPath = deletedDir / (relativePath + ".deleted");
+                    fs::create_directories(deletedBackupPath.parent_path());
+                    fs::rename(backupFilePath, deletedBackupPath);
+                }
+                fs::create_directories(backupFilePath.parent_path());
+                fs::copy_file(sourceFilePath, backupFilePath, fs::copy_options::overwrite_existing);
+            }));
         }
+    }
+
+    // Wait for all copy tasks to finish
+    for (auto& task : copyTasks) {
+        task.get();
+    }
+    if (filesToCopy == 0) {
+        std::cout << "No new or modified files to copy." << std::endl;
     }
 
     // 2. Check for deleted files
+    int filesDeleted = 0;
     for (const auto& [relativePath, backupWriteTime] : backupFiles) {
         if (sourceFiles.find(relativePath) == sourceFiles.end()) {
-            // File was deleted from source
             fs::path backupFilePath = backupDir / relativePath;
             fs::path destination = deletedDir / (relativePath + ".deleted");
-
-            // Ensure the directory exists in the deleted folder
             fs::create_directories(destination.parent_path());
             fs::rename(backupFilePath, destination);
             std::cout << "File deleted from source, moved to deleted folder: " << relativePath << std::endl;
+            ++filesDeleted;
         }
     }
-
-    // 3. Purging of old files has been removed.
-    // Files in the 'deletedDir' will be kept indefinitely.
+    if (filesDeleted == 0) {
+        std::cout << "No files deleted from source." << std::endl;
+    }
 
     std::cout << "Backup check finished." << std::endl;
 }
@@ -89,7 +123,9 @@ void runBackup() {
 int main() {
     while (true) {
         runBackup();
-        std::cout << "Next check in " << checkIntervalHours << " hour(s)." << std::endl;
+        // Clear the console output before displaying the waiting message
+        system("cls");
+        std::cout << "Waiting for the next check in " << checkIntervalHours << " hour(s)..." << std::endl;
         std::this_thread::sleep_for(std::chrono::hours(checkIntervalHours));
     }
     return 0;
